@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 from urllib.parse import urlparse
@@ -77,7 +78,7 @@ def download(
             found_username = next(iter(expr.find(json_info)), None)
             username = "__unknown__" if found_username is None else found_username.value
 
-            destination = os.path.join(destination_folder, f"{username}_{postfix}")
+            destination = Path(destination_folder, f"{username}_{postfix}")
 
             os.makedirs(destination, exist_ok=True)
 
@@ -85,21 +86,21 @@ def download(
                 "utf-8"
             )
             download_links = [
-                link for link in parsed_links.split("\n") if len(l) > 0 and not l.startswith("|")
+                link for link in parsed_links.split("\n") if len(link) > 0 and not link.startswith("|")
             ]
 
             if interactive and len(download_links) > 1:
-                CHECKBOX_NAME = "images"
+                checkbox_name = "images"
                 questions = [
                     inquirer.Checkbox(
-                        CHECKBOX_NAME,
+                        checkbox_name,
                         message=f"Multiple images found at {link}. Select images to download",
                         carousel=True,
                         choices=download_links,
                     ),
                 ]
 
-                download_links = inquirer.prompt(questions)[CHECKBOX_NAME]
+                download_links = inquirer.prompt(questions)[checkbox_name]
 
                 print(f"You selected {download_links}")
 
@@ -114,9 +115,9 @@ def download(
 
                 print(f"Downloading {link} filename={filename} author={username}")
 
-                filename = os.path.join(destination, filename)
+                file_path = Path(destination, filename)
                 subprocess.run(
-                    ["wget", "-O", filename, download_link], stdout=STDOUT, stderr=STDOUT, check=True
+                    ["wget", "-O", file_path, download_link], stdout=STDOUT, stderr=STDOUT, check=True
                 )
 
 
@@ -178,7 +179,7 @@ def move(source_folder: str, destination_folder: str, postfix: str, interactive:
             name = new_name
 
         destination_name = f"{name}_id{pixiv_id}_{postfix}"
-        shutil.move(folder.path, os.path.join(destination_folder, destination_name))
+        shutil.move(folder.path, Path(destination_folder, destination_name))
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
