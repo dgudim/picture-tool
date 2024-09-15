@@ -3,11 +3,15 @@
 import json
 import os
 from pathlib import Path
+import random
 import shutil
+import string
 import subprocess
+from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
 
 import re
+import hashlib
 
 import click
 import inquirer
@@ -24,22 +28,25 @@ AUTHOR_MAPPING_FILE = Path(
 AUTHOR_MAPPING: dict[str, str] = {}
 
 
+def sha256sum(filename: Path):
+    return hashlib.sha256(filename.read_bytes()).hexdigest()
+
+
 def strip_link(link: str):
     return link.strip().split("?")[0]
 
 
 def ensure_author_mapping_loaded():
-    if not os.path.exists(AUTHOR_MAPPING_FILE):
-        with open(AUTHOR_MAPPING_FILE, mode="r+", encoding="utf-8") as mapping_file:
-            mapping_file.write("{}")
+    if not AUTHOR_MAPPING_FILE.exists():
+        AUTHOR_MAPPING_FILE.write_text("{}", encoding="utf-8")
 
-    with open(AUTHOR_MAPPING_FILE, mode="r", encoding="utf-8") as mapping_file:
-        global AUTHOR_MAPPING
-        AUTHOR_MAPPING = json.load(mapping_file)
+    global AUTHOR_MAPPING
+    AUTHOR_MAPPING = json.loads(AUTHOR_MAPPING_FILE.read_text(encoding="utf-8"))
 
 
 def get_author_mapping(author: str):
     ensure_author_mapping_loaded()
+    global AUTHOR_MAPPING
     return AUTHOR_MAPPING.get(author, None)
 
 
@@ -48,8 +55,7 @@ def set_author_mapping(author: str, maps_to: str):
     global AUTHOR_MAPPING
     AUTHOR_MAPPING[author] = maps_to
 
-    with open(AUTHOR_MAPPING_FILE, mode="w", encoding="utf-8") as mapping_file:
-        json.dump(AUTHOR_MAPPING, mapping_file)
+    AUTHOR_MAPPING_FILE.write_text(json.dumps(AUTHOR_MAPPING), encoding="utf-8")
 
 
 def get_or_prompt_username_mapping(original: str, recommended: str) -> str:
@@ -89,6 +95,8 @@ def download(
 ):
     """This command downloads pictures from artstation."""
 
+    links_source_file = Path(links_file_path)
+
     STDOUT = subprocess.STDOUT if no_suppress_output else subprocess.DEVNULL
 
     os.makedirs(destination_folder, exist_ok=True)
@@ -96,14 +104,13 @@ def download(
     try:
         subprocess.run(["gallery-dl", "-v"], stdout=STDOUT, stderr=STDOUT, check=True)
     except subprocess.CalledProcessError as grepexc:
-        print("Error running gallery-dl -v", grepexc.returncode, grepexc.output)
+        logger.error("Error running gallery-dl -v", grepexc.returncode, grepexc.output)
 
-    with open(links_file_path, mode="r", encoding="utf-8") as links_file:
-        all_links = [
-            lst
-            for link in links_file.read().split("\n")
-            if len(lst := strip_link(link)) > 0
-        ]
+    all_links = [
+        lst
+        for link in links_source_file.read_text(encoding="utf-8").split("\n")
+        if len(lst := strip_link(link)) > 0
+    ]
 
     direct_links = [
         link
@@ -137,9 +144,8 @@ def download(
 
         author = get_or_prompt_username_mapping(username, username)
 
-        destination = Path(destination_folder, f"{author}_artstation")
-
-        os.makedirs(destination, exist_ok=True)
+        destination_subfolder = Path(destination_folder, f"{author}_artstation")
+        os.makedirs(destination_subfolder, exist_ok=True)
 
         gallery_dl_raw_links = subprocess.check_output(
             ["gallery-dl", link, "-g"]
@@ -170,22 +176,51 @@ def download(
 
             links_to_download = inquirer.prompt(questions)[checkbox_name]
 
-            print(f"You selected: {links_to_download}")
+            logger.info(f"You selected: {links_to_download}")
 
         for download_link in links_to_download:
-            parsed_link = urlparse(download_link)
+            filename = os.path.basename(urlparse(download_link).path)
 
-            filename = os.path.basename(parsed_link.path)
+            logger.info(f"Downloading {link} filename={filename} author={username}")
 
-            print(f"Downloading {link} filename={filename} author={username}")
+            with TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir, filename)
+                final_path = Path(destination_subfolder, filename)
+                subprocess.run(
+                    ["wget", "-O", temp_path, download_link],
+                    stdout=STDOUT,
+                    stderr=STDOUT,
+                    check=True,
+                )
+                if not final_path.exists():
+                    temp_path.rename(final_path)
+                    logger.info(f"{temp_path} -> {final_path}")
+                    return
 
-            file_path = Path(destination, filename)
-            subprocess.run(
-                ["wget", "-O", file_path, download_link],
-                stdout=STDOUT,
-                stderr=STDOUT,
-                check=True,
-            )
+                orig_stem = final_path.stem
+                temp_hash = sha256sum(temp_path)
+
+                i = 1
+                while final_path.exists():
+                    logger.warning(f"{final_path} already exists")
+
+                    target_hash = sha256sum(final_path)
+
+                    if target_hash == temp_hash:
+                        logger.warning("Hashes match, not moving")
+                        return
+
+                    logger.warning("Hashes don't match, adding postfix")
+                    final_path = final_path.with_stem(
+                        f"{orig_stem}_{i}"
+                    )
+                    i += 1
+
+                temp_path.rename(final_path)
+                logger.info(f"{temp_path} -> {final_path}")
+
+    # We are done here, save unknown links
+    links_source_file.write_text("\n".join(unknown_links), encoding="utf-8")
 
 
 @click.command()
@@ -210,7 +245,7 @@ def download(
 def move_pixiv(source_folder: str, destination_folder: str, postfix: str):
     """This command moves pictures from one folder to another."""
     if not os.path.isdir(source_folder):
-        print("Please enter valid source_folder")
+        logger.error("Please enter valid source_folder")
         return
 
     os.makedirs(destination_folder, exist_ok=True)
@@ -219,21 +254,22 @@ def move_pixiv(source_folder: str, destination_folder: str, postfix: str):
     subfolders = [f for f in os.scandir(source_folder) if f.is_dir()]
 
     for folder in subfolders:
-        parts = folder.name.split(SEPARATOR)
+        parts = folder.name.split(SEPARATOR)  # <author_name>_<id>
 
         name = SEPARATOR.join(parts[:-1])
         pixiv_id = parts[-1]
 
-        if not name.isascii():
-            recommended_name = "".join(
-                [item["hepburn"] for item in converter.convert(name)]
-            )
-        else:
-            recommended_name = name
+        recommended_name = (
+            name
+            if name.isascii()
+            else "".join([item["hepburn"] for item in converter.convert(name)])
+        )
 
         author = get_or_prompt_username_mapping(name, recommended_name)
 
-        destination_name = f"{author}_id{pixiv_id}_{postfix}"
+        destination_name = (
+            f"{author}_id{pixiv_id}_{postfix}"  # TODO: Match by id in the destination
+        )
         shutil.move(folder.path, Path(destination_folder, destination_name))
 
 
