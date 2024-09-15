@@ -68,6 +68,33 @@ def get_or_prompt_username_mapping(original: str, recommended: str) -> str:
     set_author_mapping(original, ret)
     return ret
 
+def smart_move(source: Path, target: Path):
+    if not target.exists():
+        source.rename(target)
+        logger.info(f"{source} -> {target}")
+        return
+
+    orig_stem = target.stem
+    temp_hash = sha256sum(source)
+
+    i = 1
+    while target.exists():
+        logger.warning(f"{target} already exists")
+
+        target_hash = sha256sum(target)
+
+        if target_hash == temp_hash:
+            logger.warning("Hashes match, not moving")
+            return
+
+        logger.warning("Hashes don't match, adding postfix")
+        target = target.with_stem(
+            f"{orig_stem}_{i}"
+        )
+        i += 1
+
+    source.rename(target)
+    logger.info(f"{source} -> {target}")
 
 @click.command()
 @click.option(
@@ -98,8 +125,6 @@ def download(
     links_source_file = Path(links_file_path)
 
     STDOUT = subprocess.STDOUT if no_suppress_output else subprocess.DEVNULL
-
-    os.makedirs(destination_folder, exist_ok=True)
 
     try:
         subprocess.run(["gallery-dl", "-v"], stdout=STDOUT, stderr=STDOUT, check=True)
@@ -142,11 +167,6 @@ def download(
             logger.error("Username not found for {link}")
             continue
 
-        author = get_or_prompt_username_mapping(username, username)
-
-        destination_subfolder = Path(destination_folder, f"{author}_artstation")
-        os.makedirs(destination_subfolder, exist_ok=True)
-
         gallery_dl_raw_links = subprocess.check_output(
             ["gallery-dl", link, "-g"]
         ).decode("utf-8")
@@ -178,6 +198,14 @@ def download(
 
             logger.info(f"You selected: {links_to_download}")
 
+        if len(links_to_download) > 0:
+            author = get_or_prompt_username_mapping(username, username)
+
+            destination_subfolder = Path(destination_folder, f"{author}_artstation")
+            os.makedirs(destination_subfolder, exist_ok=True)
+        else:
+            logger.warning(f"Not downloading anything for {link}")
+
         for download_link in links_to_download:
             filename = os.path.basename(urlparse(download_link).path)
 
@@ -192,32 +220,7 @@ def download(
                     stderr=STDOUT,
                     check=True,
                 )
-                if not final_path.exists():
-                    temp_path.rename(final_path)
-                    logger.info(f"{temp_path} -> {final_path}")
-                    return
-
-                orig_stem = final_path.stem
-                temp_hash = sha256sum(temp_path)
-
-                i = 1
-                while final_path.exists():
-                    logger.warning(f"{final_path} already exists")
-
-                    target_hash = sha256sum(final_path)
-
-                    if target_hash == temp_hash:
-                        logger.warning("Hashes match, not moving")
-                        return
-
-                    logger.warning("Hashes don't match, adding postfix")
-                    final_path = final_path.with_stem(
-                        f"{orig_stem}_{i}"
-                    )
-                    i += 1
-
-                temp_path.rename(final_path)
-                logger.info(f"{temp_path} -> {final_path}")
+                smart_move(temp_path, final_path)
 
     # We are done here, save unknown links
     links_source_file.write_text("\n".join(unknown_links), encoding="utf-8")
