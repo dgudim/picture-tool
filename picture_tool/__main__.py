@@ -169,27 +169,27 @@ def download_artstation(
 
     links_source_file = Path(links_file_path)
 
-    all_links = [
+    all_links = set(
         lst
         for link in links_source_file.read_text(encoding="utf-8").split("\n")
         if len(lst := strip_link(link)) > 0
-    ]
+    )
 
-    direct_links = [
+    direct_links = set(
         link
         for link in all_links
         if re.fullmatch(r"https://cdn.\.artstation.com/p/assets/images/images.*", link)
-    ]
-    indirect_links = [
+    )
+    indirect_links = set(
         link
         for link in all_links
         if re.fullmatch(r"https://.*?artstation\.com/artwork/.+", link)
-    ]
-    unknown_links = [
+    )
+    unknown_links = set(
         link
         for link in all_links
         if (link not in direct_links and link not in indirect_links)
-    ]
+    )
 
     if len(unknown_links) > 0:
         logger.warning(f"{len(unknown_links)} are unknown")
@@ -217,9 +217,11 @@ def download_artstation(
             )  # Skip medium/low quality images from gallery-dl
         ]
 
-        links_to_download = [
-            link for link in resolved_links if strip_link(link) in indirect_links
-        ]  # If a resolved link was found in the list, use that and skip selection
+        links_to_download = set(
+            link for link in resolved_links if strip_link(link) in direct_links
+        )  # If a resolved link was found in the list, use that and skip selection
+
+        direct_links.symmetric_difference_update(links_to_download) # remove found direct links
 
         if len(resolved_links) > 1 and len(links_to_download) == 0:
             checkbox_name = "images"
@@ -271,7 +273,9 @@ def download_artstation(
                 smart_move(temp_path, final_path, tags)
 
     # We are done here, save unknown links
-    links_source_file.write_text("\n".join(unknown_links), encoding="utf-8")
+    if len(indirect_links) > 0:
+        logger.warning(f"{len(indirect_links)} dangling direct links left")
+    links_source_file.write_text("\n".join(unknown_links.union(direct_links)), encoding="utf-8")
 
 
 @click.command()
