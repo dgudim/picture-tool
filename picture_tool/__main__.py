@@ -3,11 +3,9 @@
 import json
 import os
 from pathlib import Path
-import random
-import shutil
-import string
 import subprocess
 from tempfile import TemporaryDirectory
+from typing import Optional
 from urllib.parse import urlparse
 
 import re
@@ -68,7 +66,8 @@ def get_or_prompt_username_mapping(original: str, recommended: str) -> str:
     set_author_mapping(original, ret)
     return ret
 
-def smart_move(source: Path, target: Path):
+
+def smart_move(source: Path, target: Path, tags: list[str]):
     if not target.exists():
         source.rename(target)
         logger.info(f"{source} -> {target}")
@@ -88,13 +87,46 @@ def smart_move(source: Path, target: Path):
             return
 
         logger.warning("Hashes don't match, adding postfix")
-        target = target.with_stem(
-            f"{orig_stem}_{i}"
-        )
+        target = target.with_stem(f"{orig_stem}_{i}")
         i += 1
 
     source.rename(target)
+    # Get rid of retarded photoshop tags
+    subprocess.check_call(
+        [
+            "exiftool",
+            "-overwrite_original",
+            "-HistoryParameters=",
+            "-HistoryWhen=",
+            "-HistorySoftwareAgent=",
+            "-HistoryInstanceID=",
+            "-HistoryChanged=",
+            "-HistoryAction=",
+            "-DocumentID=",
+            "-DerivedFromInstanceID=",
+            "-DerivedFromDocumentID=",
+            "-DerivedFromOriginalDocumentID=",
+            "-InstanceID=",
+            "-OriginalDocumentID=",
+            "-DocumentAncestors=",
+            target.absolute().as_posix()
+        ],
+        stdout=subprocess.STDOUT,
+        stderr=subprocess.STDOUT
+    )
+    # Add tags
+    subprocess.check_call(
+        [
+            "exiftool",
+            "-overwrite_original",
+            f"-Subject={', '.join(tags)}",
+            target.absolute().as_posix()
+        ],
+        stdout=subprocess.STDOUT,
+        stderr=subprocess.STDOUT
+    )
     logger.info(f"{source} -> {target}")
+
 
 @click.command()
 @click.option(
@@ -109,27 +141,33 @@ def smart_move(source: Path, target: Path):
     default=lambda: os.environ.get("TOOL_DESTINATION_FOLDER", ""),
     help="Folder where pictures would be placed.",
 )
-@click.option(
-    "--no-suppress-output",
-    is_flag=True,
-    help="Prompt if name contains forbidden chars.",
-    default=True,
-)
-def download(
+def download_artstation(
     links_file_path: str,
     destination_folder: str,
-    no_suppress_output: bool,
 ):
     """This command downloads pictures from artstation."""
 
-    links_source_file = Path(links_file_path)
-
-    STDOUT = subprocess.STDOUT if no_suppress_output else subprocess.DEVNULL
+    try:
+        subprocess.run(
+            ["gallery-dl", "-v"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error("Error running gallery-dl -v", e.returncode, e.output)
 
     try:
-        subprocess.run(["gallery-dl", "-v"], stdout=STDOUT, stderr=STDOUT, check=True)
-    except subprocess.CalledProcessError as grepexc:
-        logger.error("Error running gallery-dl -v", grepexc.returncode, grepexc.output)
+        subprocess.run(
+            ["exiftool", "-v"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error("Error running exiftool -v", e.returncode, e.output)
+
+    links_source_file = Path(links_file_path)
 
     all_links = [
         lst
@@ -159,13 +197,13 @@ def download(
     for link in indirect_links:
         link_info = json.loads(subprocess.check_output(["gallery-dl", link, "-j"]))
 
-        expr = parse("$..username")
+        username = next(iter(parse("$..username").find(link_info)), "")
 
-        username = next(iter(expr.find(link_info)), None)
-
-        if username is None:
-            logger.error("Username not found for {link}")
+        if len(username) == 0:
+            logger.error(f"Username not found for {link}")
             continue
+
+        tags: list[str] = next(iter(parse("$..tags").find(link_info)), [])
 
         gallery_dl_raw_links = subprocess.check_output(
             ["gallery-dl", link, "-g"]
@@ -199,10 +237,20 @@ def download(
             logger.info(f"You selected: {links_to_download}")
 
         if len(links_to_download) > 0:
-            author = get_or_prompt_username_mapping(username, username)
+            postfix = "artstation"
 
-            destination_subfolder = Path(destination_folder, f"{author}_artstation")
-            os.makedirs(destination_subfolder, exist_ok=True)
+            destination_subfolder_naive = Path(
+                destination_folder, f"{username}{postfix}"
+            )
+
+            if destination_subfolder_naive.exists():
+                destination_subfolder = destination_subfolder_naive
+            else:
+                author = get_or_prompt_username_mapping(username, username)
+
+                destination_subfolder = Path(destination_folder, f"{author}_{postfix}")
+                os.makedirs(destination_subfolder, exist_ok=True)
+
         else:
             logger.warning(f"Not downloading anything for {link}")
 
@@ -216,11 +264,11 @@ def download(
                 final_path = Path(destination_subfolder, filename)
                 subprocess.run(
                     ["wget", "-O", temp_path, download_link],
-                    stdout=STDOUT,
-                    stderr=STDOUT,
+                    stdout=subprocess.STDOUT,
+                    stderr=subprocess.STDOUT,
                     check=True,
                 )
-                smart_move(temp_path, final_path)
+                smart_move(temp_path, final_path, tags)
 
     # We are done here, save unknown links
     links_source_file.write_text("\n".join(unknown_links), encoding="utf-8")
@@ -245,19 +293,32 @@ def download(
     default="pixiv",
     help="Postfix of destination folders inside folders",
 )
-def move_pixiv(source_folder: str, destination_folder: str, postfix: str):
+def move_pixiv(source_folder_path: str, destination_folder_path: str, postfix: str):
     """This command moves pictures from one folder to another."""
-    if not os.path.isdir(source_folder):
+
+    if not os.path.isdir(source_folder_path):
         logger.error("Please enter valid source_folder")
         return
 
-    os.makedirs(destination_folder, exist_ok=True)
+    try:
+        subprocess.run(
+            ["exiftool", "-v"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error("Error running exiftool -v", e.returncode, e.output)
+        return
 
     converter = Kakasi()
-    subfolders = [f for f in os.scandir(source_folder) if f.is_dir()]
+    source_subfolders = [Path(f) for f in os.scandir(source_folder_path) if f.is_dir()]
+    destination_subfolders = [
+        Path(f) for f in os.scandir(destination_folder_path) if f.is_dir()
+    ]
 
-    for folder in subfolders:
-        parts = folder.name.split(SEPARATOR)  # <author_name>_<id>
+    for source_subfolder in source_subfolders:
+        parts = source_subfolder.name.split(SEPARATOR)  # <author_name>_<id>
 
         name = SEPARATOR.join(parts[:-1])
         pixiv_id = parts[-1]
@@ -268,12 +329,22 @@ def move_pixiv(source_folder: str, destination_folder: str, postfix: str):
             else "".join([item["hepburn"] for item in converter.convert(name)])
         )
 
-        author = get_or_prompt_username_mapping(name, recommended_name)
+        target_subfolder_f: Optional[Path] = None
 
-        destination_name = (
-            f"{author}_id{pixiv_id}_{postfix}"  # TODO: Match by id in the destination
-        )
-        shutil.move(folder.path, Path(destination_folder, destination_name))
+        for target_subfolder in destination_subfolders:
+            if f"id{pixiv_id}" in target_subfolder.stem:
+                target_subfolder_f = target_subfolder
+                break
+
+        if target_subfolder_f is None:
+            author = get_or_prompt_username_mapping(name, recommended_name)
+            target_subfolder_f = Path(
+                destination_folder_path, f"{author}_id{pixiv_id}_{postfix}"
+            )
+
+        for source_file in source_subfolder.glob("*"):
+            final_path = Path(target_subfolder_f, source_file.name)
+            smart_move(source_file, final_path, [])
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
@@ -282,7 +353,7 @@ def cli():
     pass
 
 
-cli.add_command(download)
+cli.add_command(download_artstation)
 cli.add_command(move_pixiv)
 
 if __name__ == "__main__":
